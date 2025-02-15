@@ -18,4 +18,6 @@ class Config:
 
         self.show_icon = self.config.get('config', 'show_icon') == '1'
 
+        self.show_startup_notification = self.config.get('config', 'show_startup_notification', fallback='1') == '1'
+
         self.version = self.config.get('info', 'version')

@@ -53,11 +53,11 @@ def start_server() -> tuple[bool, str]:
 
 if __name__ == '__main__':
     flag, msg = start_server()
-    if flag:
-        notifier.notify("已启动", msg)
-    else:
+    if not flag:
         notifier.notify("启动失败", msg)
         sys.exit()
+    if config.show_startup_notification:
+        notifier.notify("已启动", msg)
     if config.show_icon:
         create_icon()
     else:
