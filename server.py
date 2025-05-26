@@ -5,9 +5,11 @@ import traceback
 
 import flask
 from flask import Flask, request, Blueprint, stream_with_context
+from flask_babel import Babel, gettext as _
 
 from config import Config
 from notifier import Notifier
+import utils
 from utils import file_path_encode, avoid_duplicate_filename, file_path_decode, clean_filename
 from result import Result
 
@@ -30,9 +32,27 @@ class Server:
         self.register_test()
         self.register_file()
         self.register_clipboard()
-        self.app = Flask(__name__)
+        self.register_settings()
+        self.app = Flask(__name__, template_folder='templates')
         self.app.register_blueprint(self.blueprint)
+        
+        # Initialize Babel
+        self.babel = Babel(self.app)
+        
+        def get_locale():
+            # Try to get language from config, default to 'en'
+            return self.config.language if hasattr(self.config, 'language') else 'en'
+            
+        self.babel.init_app(self.app, locale_selector=get_locale)
 
+    def check_localhost(self, client_ip):
+        allowed_ips = ['127.0.0.1', '::1']
+        local_ip = utils.get_local_ip()
+        if local_ip is not None:
+            allowed_ips.append(local_ip)
+        if client_ip not in allowed_ips:
+            self.notifier.notify("⚠️" + _('Error:'), _('This interface only allows local access'))
+            return Result.error(msg=_('This interface only allows local access'), code=403)
     def run(self, host: str, port: int):
         self.app.run(host=host, port=port)
 
@@ -43,17 +63,22 @@ class Server:
         # 统一认证
         @self.blueprint.before_request
         def check_api_key():
-            if request.path == '/':
+            if request.path in ['/']:
+                return
+            if request.path.startswith('/settings'):
                 return
             auth_header = request.headers.get("Authorization")
             if auth_header != self.config.key:
-                self.notifier.notify("⚠️错误:", "密钥错误")
-                return Result.error(msg='密钥错误', code=401)
+                self.notifier.notify("⚠️" + _("Error:"), _("Key error"))
+                return Result.error(msg=_('Key error'), code=401)
             version = request.headers.get("ShortcutVersion")
             client_version = '.'.join(self.config.version.split('.')[:2])
             if '.'.join(version.split('.')[:2]) != client_version:
-                msg = f'''版本不匹配\n\nWindows版本为：{self.config.version}\n快捷指令版本为：{version}'''
-                self.notifier.notify("⚠️错误:", msg)
+                msg = _('Windows version: %(win_version)s\nShortcut version: %(shortcut_version)s') % {
+                    'win_version': self.config.version,
+                    'shortcut_version': version
+                }
+                self.notifier.notify("⚠️" + _("Error:"), msg)
                 return Result.error(msg=msg, code=400)
 
         # 统一异常处理
@@ -61,14 +86,14 @@ class Server:
         def handle_all_exceptions(error):
             traceback.print_exc()
             msg = str(error)
-            self.notifier.notify('⚠️错误:', msg)
+            self.notifier.notify("⚠️" + _('Error:'), msg)
             return Result.error(msg, 500)
 
     def register_test(self):
         @self.blueprint.route('/')
         def test():
-            self.notifier.notify("Test", "🌎Hello World!")
-            return '🌎Hello world!'
+            self.notifier.notify(_("Test"), _("Hello World!"))
+            return _('Hello World!')
 
     def register_file(self):
         @self.blueprint.route('/file', methods=['POST'])
@@ -79,7 +104,7 @@ class Server:
                 - file: file
             """
             if 'file' not in request.files:
-                return Result.error(msg="文件不存在")
+                return Result.error(msg=_("File does not exist"))
             file = request.files['file']
             filename = clean_filename(file.filename)
             new_filename = avoid_duplicate_filename(self.config.save_path, filename)
@@ -89,7 +114,7 @@ class Server:
                     if chunk:
                         f.write(chunk)
             self.notifier.show_file(self.config.save_path, new_filename, filename)
-            return Result.success(msg="发送成功")
+            return Result.success(msg=_("Send successful"))
 
         # 获取电脑端文件
         @self.blueprint.route('/file/<path>', methods=['GET'])
@@ -97,12 +122,12 @@ class Server:
             """ 电脑端发送文件 """
             path = file_path_decode(path)
             if path is None:
-                self.notifier.notify("⚠️错误：", "文件路径解析出错")
+                self.notifier.notify("⚠️" + _("Error："), _("Error: File path parsing error"))
                 return
             basename = os.path.basename(path)
             with open(path, 'rb') as f:
                 file_content = f.read()
-            self.notifier.notify("📄发送文件:", basename)
+            self.notifier.notify("📄" + _("Sending file:"), basename)
             return flask.send_file(io.BytesIO(file_content), as_attachment=True, download_name=basename)
 
     def register_clipboard(self):
@@ -113,7 +138,7 @@ class Server:
             success, res = clipboard.get_text()
             if success:
                 dto = get_clipboard_dto(clipboard.Type.TEXT, res)
-                self.notifier.notify('📝发送剪贴板文本:', res)
+                self.notifier.notify("📝" + _('Sending clipboard text:'), res)
                 return Result.success(data=dto)
             # 文件
             success, res = clipboard.get_files()
@@ -125,11 +150,11 @@ class Server:
             success, res = clipboard.get_img_base64()
             if success:
                 dto = get_clipboard_dto(clipboard.Type.IMG, res)
-                self.notifier.notify('🏞️发送剪贴板图片', "")
+                self.notifier.notify("🏞️" + _('Sending clipboard image'), "")
                 return Result.success(data=dto)
 
-            self.notifier.notify('⚠️发送剪贴板出错:', 'Windows剪贴板为空')
-            return Result.error(msg='Windows剪贴板为空')
+            self.notifier.notify("⚠️" + _('Error sending clipboard:'), _('Windows clipboard is empty'))
+            return Result.error(msg=_('Windows clipboard is empty'))
 
         # 接收手机端剪贴板
         @self.blueprint.route('/clipboard', methods=['POST'])
@@ -141,11 +166,48 @@ class Server:
             """
             text = request.form['clipboard']
             if text is None or text == '':
-                self.notifier.notify('⚠️设置剪贴板出错:', ' iPhone剪贴板为空')
-                return Result.error(msg='iPhone剪贴板为空')
+                self.notifier.notify("⚠️" + _('Error setting clipboard:'), _('iPhone clipboard is empty'))
+                return Result.error(msg=_('iPhone clipboard is empty'))
             success, msg = clipboard.set_text(text)
             if success:
-                self.notifier.notify('📝设置剪贴板文本:', text)
+                self.notifier.notify("📝" + _('Sending clipboard text:'), text)
             else:
-                self.notifier.notify('⚠️设置剪贴板出错:', msg)
-            return Result.success(msg='发送成功') if success else Result.error(msg=msg)
+                self.notifier.notify("⚠️" + _('Error setting clipboard:'), msg)
+            return Result.success(msg=_('Send successful')) if success else Result.error(msg=msg)
+    
+    def register_settings(self):
+        # 配置页面
+        @self.blueprint.route('/settings')
+        def settings_page():
+            self.check_localhost(request.remote_addr)
+            return flask.render_template('settings.html', config=self.config)
+
+        @self.blueprint.route('/settings/configs')
+        def get_configs():
+            localhost_result = self.check_localhost(request.remote_addr)
+            if localhost_result is not None:
+                return localhost_result
+            config_dict = {
+                'key': self.config.key,
+                'save_path': self.config.save_path,
+                'port': self.config.port,
+                'basic_notifier': self.config.basic_notifier,
+                'show_icon': self.config.show_icon,
+                'startup_notification': self.config.startup_notification,
+                'version': self.config.version,
+                'language': self.config.language,
+            }
+            return Result.success(data=config_dict)
+
+        @self.blueprint.route('/settings/configs', methods=['POST'])
+        def set_configs():
+            localhost_result = self.check_localhost(request.remote_addr)
+            if localhost_result is not None:
+                return localhost_result
+            config_dict = request.json
+            update_state = self.config.update(config_dict)
+            if update_state is not None:
+                self.notifier.notify("⚙️" + _("Settings"), _("Configuration save failed:") + update_state[0].json['msg'])
+                return update_state
+            self.notifier.notify("⚙️" + _("Settings"), _("Configuration saved"))
+            return Result.success(data=config_dict)
